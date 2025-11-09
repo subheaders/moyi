@@ -1,0 +1,8 @@
+chess_model.pt
+*.pt
+__pycache__
+data/data-10m.pgn
+maia/
+TODO
+great.pgn
+backupmodels/
