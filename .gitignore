@@ -24,3 +24,4 @@ archived
 !pretrain.py
 !model.py
 !utils/pgn_dataset.py
+!tests.py
