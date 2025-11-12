@@ -1,256 +1,302 @@
+# train_transformer.py
 import os
+import argparse
 import torch
-import torch.nn as nn
 import torch.optim as optim
-import chess
-import numpy as np
-import concurrent.futures
-from threading import Lock
-from model import load_model
+import gc
 from tqdm import tqdm
+from torch.utils.data import IterableDataset, DataLoader
 
-# --- Configuration ---
-USE_COMPILE = False
-USE_BFLOAT16 = True       # use bfloat16 (recommended on RTX 4060)
-USE_AMP = False           # GradScaler only for fp16; disabled for bf16
-USE_CUDA_GRAPHS = False   # Disabled by default (unstable on some setups)
-ASYNC_WORKERS = 4
-BATCH_SELF_PLAY = True
-GRAD_ACCUMULATION_STEPS = 4
-CUDA_GRAPH_CAPTURE_BATCH = 64
+# Use transformer_model loader
+from transformer_model import load_model
+from utils.pgn_dataset import iter_pgn_positions, estimate_game_count
 
-# --- Setup ---
+
+
+# ==============================
+# Optional performance toggles
+# ==============================
+USE_TORCH_COMPILE = False  # Enable torch.compile()
+USE_FP8 = False
+
+if USE_FP8:
+    import transformer_engine.pytorch as te
+    from transformer_engine.pytorch.fp8 import fp8_autocast, fp8_update
+else:
+    te = None  # type: ignore
+
+            # Enable FP8 training (PyTorch native autocast)
+
 if torch.cuda.is_available():
     DEVICE = "cuda"
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    DEVICE = "mps"  
+    DEVICE = "mps"
 else:
     DEVICE = "cpu"
-print(f"Using device: {DEVICE}")
 
-def setup_optimizations():
-    if DEVICE == "cuda":
+DATA_PATH = os.path.join("data", "lichess_elite_2023-01.pgn")
+
+if DEVICE == "cuda":
+    try:
+        torch.backends.cuda.matmul.fp32_precision = "tf32"
+    except Exception:
         try:
             torch.set_float32_matmul_precision("high")
         except Exception:
             pass
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+
+# ==============================
+# Dataset wrapper for DataLoader
+# ==============================
+class PGNDataset(IterableDataset):
+    def __init__(self, pgn_path, max_games=None):
+        self.pgn_path = pgn_path
+        self.max_games = max_games
+
+    def __iter__(self):
+        worker_info = None
         try:
-            torch.cuda.set_per_process_memory_fraction(0.8)
+            from torch.utils.data import get_worker_info
+            worker_info = get_worker_info()
         except Exception:
-            pass
-    torch.set_num_threads(max(1, torch.get_num_threads() // 2))
+            worker_info = None
 
-setup_optimizations()
+        if worker_info is None:
+            return iter_pgn_positions(self.pgn_path, max_games=self.max_games)
+        else:
+            return iter_pgn_positions(
+                self.pgn_path,
+                max_games=self.max_games,
+                worker_id=worker_info.id,
+                num_workers=worker_info.num_workers,
+            )
 
-# --- Board Encoding ---
-def encode_board(board):
-    planes = torch.zeros((18, 8, 8), dtype=torch.float32)
-    piece_map = board.piece_map()
-    positions = []
-    for idx, piece in piece_map.items():
-        plane_offset = 0 if piece.color == chess.WHITE else 6
-        piece_plane = piece.piece_type - 1
-        row, col = divmod(idx, 8)
-        positions.append((plane_offset + piece_plane, row, col))
-    if positions:
-        planes[tuple(zip(*positions))] = 1.0
-    return planes
+# ==============================
+# Training logic
+# ==============================
+def pretrain(
+    pgn_path: str = DATA_PATH,
+    model_path_out: str = "chess_transformer.pt",
+    init_model_path: str | None = None,
+    max_games: int | None = None,
+    epochs: int = 1,
+    batch_size: int = 512,
+    lr: float = 1e-3,
+    weight_policy: float = 1.0,
+    weight_value: float = 1.0,
+    # hyperparameters for transformer (defaults can be tuned)
+    num_layers: int = 8,
+    dim: int = 512,
+    num_heads: int = 8,
+    mlp_ratio: float = 4.0,
+    dropout: float = 0.1,
+    attn_dropout: float = 0.0,
+    use_rope: bool = True,
+    share_heads: bool = True,
+):
+    assert os.path.exists(pgn_path), f"PGN file not found: {pgn_path}"
 
-def calculate_reward(outcome):
-    if outcome is None:
-        return 0
-    if outcome.winner is True:
-        return 1
-    if outcome.winner is False:
-        return -1
-    return 0
-
-# --- Self-Play (batch) ---
-@torch.no_grad()
-def self_play_batch(model, num_games=50, max_moves=100):
-    model.eval()
-    games = [chess.Board() for _ in range(num_games)]
-    active_games = list(range(num_games))
-    all_states, all_rewards = [], []
-    game_states = {i: [] for i in range(num_games)}
-
-    move_count = 0
-    while active_games and move_count < max_moves:
-        batch_states, game_indices = [], []
-        for game_idx in active_games:
-            board = games[game_idx]
-            if not board.is_game_over():
-                state = encode_board(board)
-                batch_states.append(state)
-                game_indices.append(game_idx)
-                game_states[game_idx].append(state)
-        if not batch_states:
-            break
-
-        state_batch = torch.stack(batch_states).to(DEVICE)
-        policy_batch, _ = model(state_batch)
-
-        new_active_games = []
-        for i, game_idx in enumerate(game_indices):
-            board = games[game_idx]
-            legal_moves = list(board.legal_moves)
-            if legal_moves and not board.is_game_over():
-                move_idx = torch.argmax(policy_batch[i]).item() % len(legal_moves)
-                chosen_move = legal_moves[move_idx]
-                board.push(chosen_move)
-                if not board.is_game_over():
-                    new_active_games.append(game_idx)
-                else:
-                    outcome = board.outcome()
-                    reward = calculate_reward(outcome)
-                    all_states.extend(game_states[game_idx])
-                    all_rewards.extend([reward] * len(game_states[game_idx]))
-        active_games = new_active_games
-        move_count += 1
-
-    # incomplete games => treat as draw
-    for game_idx in active_games:
-        if game_states[game_idx]:
-            all_states.extend(game_states[game_idx])
-            all_rewards.extend([0] * len(game_states[game_idx]))
-
-    return all_states, all_rewards
-
-# --- Async Data Generator ---
-class AsyncDataGenerator:
-    def __init__(self, model, num_workers=4):
-        self.model = model
-        self.num_workers = num_workers
-        self.data_buffer = []
-        self.lock = Lock()
-
-    def generate_async(self, total_games):
-        self.data_buffer.clear()
-        games_per_worker = max(1, total_games // self.num_workers)
-        remaining_games = total_games % self.num_workers
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            futures = []
-            for i in range(self.num_workers):
-                games_to_play = games_per_worker + (1 if i < remaining_games else 0)
-                if games_to_play > 0:
-                    futures.append(
-                        executor.submit(self_play_batch, self.model, games_to_play)
-                    )
-
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    states, rewards = future.result()
-                    with self.lock:
-                        self.data_buffer.extend(list(zip(states, rewards)))
-                except Exception as e:
-                    print("Error in async generation:", e)
-
-        return self.data_buffer
-
-# --- Training ---
-def main():
-    model_path = "chess_model.pt"
-    model = load_model(None, DEVICE)
-
-    # 🔥 Load saved model if available
-    if os.path.exists(model_path):
-        try:
-            state_dict = torch.load(model_path, map_location=DEVICE)
-            model.load_state_dict(state_dict)
-            print(f"✅ Loaded existing model from {model_path}")
-        except Exception as e:
-            print(f"⚠️ Could not load {model_path}: {e}")
-    else:
-        print("🆕 No saved model found — starting fresh.")
-
-    if USE_COMPILE:
-        try:
-            model = torch.compile(model)
-        except Exception as e:
-            print("Compile failed:", e)
-
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"🧠 Model parameter count: {total_params:,}")
-
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, fused=True, foreach=False)
-
-    scheduler = optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=1e-3, epochs=100, steps_per_epoch=200, pct_start=0.1
+    # Pass config kwargs to the transformer loader
+    model = load_model(
+        init_model_path,
+        DEVICE,
+        num_layers=num_layers,
+        dim=dim,
+        num_heads=num_heads,
+        mlp_ratio=mlp_ratio,
+        dropout=dropout,
+        attn_dropout=attn_dropout,
+        use_rope=use_rope,
+        share_heads=share_heads,
     )
 
-    EPOCHS = 500
-    GAMES_PER_EPOCH = 20  # reduced to avoid OOM
-    total_games = EPOCHS * GAMES_PER_EPOCH
+    # Log total parameter count at startup (redundant with model print, but helpful)
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model parameters: total={total_params:,} | trainable={trainable_params:,}")
 
-    data_gen = AsyncDataGenerator(model, num_workers=ASYNC_WORKERS) if ASYNC_WORKERS > 1 else None
+    model.train()
 
-    pbar = tqdm(total=total_games, desc="Training Games", ncols=100)
+    # Optional torch.compile
+    if USE_TORCH_COMPILE:
+        print("Compiling model with torch.compile() for performance...")
+        model = torch.compile(model)
 
-    cuda_graph = None
-    precision_dtype = torch.bfloat16 if USE_BFLOAT16 else torch.float16
+    # Use fused AdamW when available
+    use_fused = DEVICE == "cuda"
+    try:
+        optimizer = optim.AdamW(model.parameters(), lr=lr, fused=use_fused)
+    except TypeError:
+        optimizer = optim.AdamW(model.parameters(), lr=lr)
 
-    for epoch in range(EPOCHS):
-        model.train()
+    if DEVICE == "cuda":
+        if not torch.cuda.is_bf16_supported() and not USE_FP8:
+            raise RuntimeError("bf16 required but not supported on this CUDA device.")
+        print(f"Using device: {DEVICE}")
+        print(f"FP8 training: {'enabled' if USE_FP8 else 'disabled (using bf16)'}")
+    else:
+        print("WARNING: Running on CPU; training will be fp32.")
 
-        # --- Data Generation ---
-        if data_gen and BATCH_SELF_PLAY:
-            game_data = data_gen.generate_async(GAMES_PER_EPOCH)
-            pbar.update(GAMES_PER_EPOCH)
-        else:
-            game_data = []
-            for _ in range(GAMES_PER_EPOCH):
-                states, rewards = self_play_batch(model)
-                game_data.extend(zip(states, rewards))
-                pbar.update(1)
+    print(f"Pretraining from PGN: {pgn_path}")
+    if max_games:
+        print(f"Max games: {max_games}")
+    print(f"Epochs: {epochs}, Batch size: {batch_size}")
 
-        if not game_data:
-            continue
+    est_games = estimate_game_count(pgn_path)
+    if est_games is not None:
+        print(f"Estimated total games in PGN: {est_games}")
+    else:
+        print("Could not estimate total games; tqdm will show dynamic count only.")
 
-        states, rewards = zip(*game_data)
-        X = torch.stack(states).to(DEVICE, non_blocking=True)
-        y = torch.tensor(rewards, dtype=torch.float32).unsqueeze(1).to(DEVICE, non_blocking=True)
+    dataset = PGNDataset(pgn_path, max_games=max_games)
+    if DEVICE == "cuda":
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            num_workers=4,
+            pin_memory=True,
+            prefetch_factor=2,
+            persistent_workers=True,
+        )
+    else:
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            num_workers=0,
+        )
 
-        optimizer.zero_grad(set_to_none=True)
-        total_loss = 0.0
-        batch_size = max(1, len(X) // GRAD_ACCUMULATION_STEPS)
+    try:
+        for epoch in range(epochs):
+            print(f"\nEpoch {epoch + 1}/{epochs}")
+            total_games = None
+            if est_games is not None:
+                effective_games = est_games if max_games is None else min(est_games, max_games)
+                total_games = effective_games
 
-        for i in range(0, len(X), batch_size):
-            end_idx = min(i + batch_size, len(X))
-            batch_X = X[i:end_idx]
-            batch_y = y[i:end_idx]
+            pbar = tqdm(
+                desc=f"Pretraining games (epoch {epoch + 1}/{epochs})",
+                unit="games",
+                total=total_games,
+            )
 
-            with torch.autocast(device_type=DEVICE, dtype=precision_dtype):
-                pred_p, pred_v = model(batch_X)
-                value_loss = torch.mean((pred_v - batch_y) ** 2)
-                target_policy = torch.ones_like(pred_p) / pred_p.size(1)
-                policy_loss = -torch.sum(target_policy * torch.log_softmax(pred_p, dim=1)) / pred_p.size(0)
-                loss = (value_loss + 0.01 * policy_loss) / GRAD_ACCUMULATION_STEPS
+            for batch_boards, batch_policy, batch_value, batch_is_last in dataloader:
+                loss = train_batch(
+                    model,
+                    optimizer,
+                    batch_boards,
+                    batch_policy,
+                    batch_value,
+                    weight_policy,
+                    weight_value,
+                )
+                try:
+                    games_completed = int(batch_is_last.sum().item())
+                except Exception:
+                    games_completed = int(sum(int(x) for x in batch_is_last))
 
-            loss.backward()
-            total_loss += float(loss.item() * GRAD_ACCUMULATION_STEPS)
+                if games_completed > 0:
+                    pbar.update(games_completed)
 
-            step_idx = (i // batch_size) + 1
-            if (step_idx % GRAD_ACCUMULATION_STEPS) == 0 or (end_idx == len(X)):
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-                scheduler.step()
+                pbar.set_postfix({"loss": f"{loss:.4f}"})
 
-        pbar.set_postfix({
-            "loss": f"{total_loss:.4f}",
-            "epoch": f"{epoch + 1}/{EPOCHS}",
-            "lr": f"{scheduler.get_last_lr()[0]:.2e}"
-        })
+            pbar.close()
+            print(f"Epoch {epoch + 1} completed.")
 
-        # 🔄 Save model after every epoch
-        torch.save(model.state_dict(), model_path)
+            torch.save(model.state_dict(), model_path_out)
+            print(f"Saved pretrained model to {model_path_out}")
+    finally:
+        try:
+            del dataloader
+        except Exception:
+            pass
+        gc.collect()
+        if DEVICE == "cuda":
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
-    pbar.close()
-    print("\n✅ Training complete — model saved as chess_model.pt")
+    print("Pretraining complete.")
+
+# ==============================
+# Single batch training
+# ==============================
+def train_batch(model, optimizer, boards, policies, values, weight_policy, weight_value):
+    model.train()
+    X = boards.to(DEVICE, non_blocking=True)
+    target_p = policies.to(DEVICE, non_blocking=True)
+    target_v = values.to(DEVICE, non_blocking=True)
+
+    optimizer.zero_grad(set_to_none=True)
+
+    if USE_FP8 and DEVICE == "cuda":
+        with fp8_autocast(enabled=True):
+            log_p, v = model(X)
+            policy_loss = -(target_p * log_p).sum(dim=1).mean()
+            value_loss = torch.mean((v - target_v) ** 2)
+            loss = weight_policy * policy_loss + weight_value * value_loss
+    else:
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            log_p, v = model(X)
+            policy_loss = -(target_p * log_p).sum(dim=1).mean()
+            value_loss = torch.mean((v - target_v) ** 2)
+            loss = weight_policy * policy_loss + weight_value * value_loss
+
+    loss.backward()
+    if USE_FP8:
+        fp8_update(model)
+
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    optimizer.step()
+    return float(loss.item())
+# ==============================
+# CLI parsing
+# ==============================
+def parse_args():
+    parser = argparse.ArgumentParser(description="Supervised pretraining from PGN (Transformer).")
+    parser.add_argument("--pgn", type=str, default=DATA_PATH, help="Path to PGN file.")
+    parser.add_argument("--init", type=str, default=None, help="Optional initial model checkpoint.")
+    parser.add_argument("--out", type=str, default="chess_transformer.pt", help="Output model path.")
+    parser.add_argument("--max-games", type=int, default=None, help="Limit number of games.")
+    parser.add_argument("--epochs", type=int, default=1, help="Number of passes over PGN.")
+    parser.add_argument("--batch-size", type=int, default=512, help="Batch size.")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
+    parser.add_argument("--weight-policy", type=float, default=1.0, help="Policy loss weight.")
+    parser.add_argument("--weight-value", type=float, default=1.0, help="Value loss weight.")
+    # transformer hyperparams exposed as CLI options
+    parser.add_argument("--num-layers", type=int, default=8, help="Transformer layers")
+    parser.add_argument("--dim", type=int, default=256, help="Model width")
+    parser.add_argument("--num-heads", type=int, default=4, help="Attention heads")
+    parser.add_argument("--mlp-ratio", type=float, default=4.0, help="MLP expansion ratio")
+    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout")
+    parser.add_argument("--attn-dropout", type=float, default=0.0, help="Attention dropout")
+    parser.add_argument("--use-rope", action="store_true", help="Enable RoPE")
+    parser.add_argument("--share-heads", action="store_true", help="Share head projection for policy/value")
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
+    pretrain(
+        pgn_path=args.pgn,
+        model_path_out=args.out,
+        init_model_path=args.init,
+        max_games=args.max_games,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        weight_policy=args.weight_policy,
+        weight_value=args.weight_value,
+        num_layers=args.num_layers,
+        dim=args.dim,
+        num_heads=args.num_heads,
+        mlp_ratio=args.mlp_ratio,
+        dropout=args.dropout,
+        attn_dropout=args.attn_dropout,
+        use_rope=args.use_rope,
+        share_heads=args.share_heads,
+    )
 
 if __name__ == "__main__":
     main()

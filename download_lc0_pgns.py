@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 from typing import List
@@ -10,9 +11,10 @@ import requests
 from tqdm import tqdm
 
 BASE_URL = "https://storage.lczero.org/files/match_pgns/3/"
-OUTPUT_PATH = "data/lc0-2.pgn"
+OUTPUT_PATH = "data/lc0-3.pgn"
 MAX_WORKERS = 16
 CHUNK_SIZE = 1024 * 1024  # 1 MiB
+LIMIT = 0  # default maximum number of files to download; set <=0 for no limit
 
 
 class PGNLinkParser(HTMLParser):
@@ -62,6 +64,10 @@ def download_and_collect(url: str):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Download LCZero PGN files and combine them into one file.")
+    parser.add_argument("--limit", type=int, default=LIMIT, help="Maximum number of files to download (default: 200). Use 0 or negative for no limit.")
+    args = parser.parse_args()
+
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
 
     print(f"Fetching index from {BASE_URL}...")
@@ -72,7 +78,13 @@ def main():
         print("No .pgn links found on the page.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Found {len(links)} .pgn files. Downloading with {MAX_WORKERS} threads...")
+    total_found = len(links)
+    # Apply limit if provided (>0)
+    if args.limit > 0 and total_found > args.limit:
+        links = links[: args.limit]
+    to_download = len(links)
+
+    print(f"Found {total_found} .pgn files. Downloading {to_download} with {MAX_WORKERS} threads...")
 
     # Open target file once and append as downloads complete
     with open(OUTPUT_PATH, "wb") as out_f:

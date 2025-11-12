@@ -1,246 +1,65 @@
-import os
-import argparse
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import chess
-from tqdm import tqdm
+import os, torch, gc, argparse
 from torch.utils.data import IterableDataset, DataLoader
-
+from torch import nn, optim
+from tqdm import tqdm
 from model import load_model
 from utils.pgn_dataset import iter_pgn_positions, estimate_game_count
 
-# ==============================
-# Optional performance toggles
-# ==============================
-USE_TORCH_COMPILE = False  # Enable torch.compile()
-USE_FP8 = False            # Enable FP8 training (PyTorch native autocast)
+DEVICE = "cuda" if torch.cuda.is_available() else "mps" if hasattr(torch.backends,"mps") and torch.backends.mps.is_available() else "cpu"
+DATA_PATH = os.path.join("data","lichess_elite_2023-01.pgn")
+USE_TORCH_COMPILE, USE_FP8 = False, False
 
-    
-if torch.cuda.is_available():
-    DEVICE = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    DEVICE = "mps"  
-else:
-    DEVICE = "cpu"
+if DEVICE=="cuda":
+    try: torch.backends.cuda.matmul.fp32_precision="tf32"
+    except: pass
+    torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic = True, False
 
-  
-DATA_PATH = os.path.join("data", "lc0-1.pgn")
-
-
-if DEVICE == "cuda":
-    torch.set_float32_matmul_precision("high")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.deterministic = False
-
-torch.backends.cudnn.benchmark = True
-torch.backends.cudnn.deterministic = False
-
-
-# ==============================
-# Dataset wrapper for DataLoader
-# ==============================
 class PGNDataset(IterableDataset):
-    def __init__(self, pgn_path, max_games=None):
-        self.pgn_path = pgn_path
-        self.max_games = max_games
-
+    def __init__(self,pgn_path,max_games=None): self.pgn_path,self.max_games=pgn_path,max_games
     def __iter__(self):
-        return iter_pgn_positions(self.pgn_path, max_games=self.max_games)
+        try: from torch.utils.data import get_worker_info; w=get_worker_info()
+        except: w=None
+        return iter_pgn_positions(self.pgn_path,max_games=self.max_games,worker_id=getattr(w,"id",None),num_workers=getattr(w,"num_workers",None))
 
-# ==============================
-# Training logic
-# ==============================
-def pretrain(
-    pgn_path: str = DATA_PATH,
-    model_path_out: str = "chess_model.pt",
-    init_model_path: str | None = None,
-    max_games: int | None = None,
-    epochs: int = 1,
-    batch_size: int = 512,
-    lr: float = 1e-3,
-    weight_policy: float = 1.0,
-    weight_value: float = 1.0,
-):
-    assert os.path.exists(pgn_path), f"PGN file not found: {pgn_path}"
-
-    model = load_model(init_model_path, DEVICE)
-
-    # Log total parameter count at startup
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model parameters: total={total_params:,} | trainable={trainable_params:,}")
-
+def train_batch(model,opt,X,P,V,wP,wV):
     model.train()
+    X,P,V=[t.to(DEVICE,non_blocking=True) for t in (X,P,V)]
+    opt.zero_grad(set_to_none=True)
+    ctx=torch.amp.autocast("cuda" if DEVICE=="cuda" else "mps",dtype=torch.bfloat16) if DEVICE!="cpu" else nullcontext()
+    with ctx:
+        logP,v=model(X)
+        loss=wP*(-(P*logP).sum(1).mean())+wV*((v-V)**2).mean()
+    loss.backward(); nn.utils.clip_grad_norm_(model.parameters(),1.0); opt.step()
+    val=float(loss.item()); del loss,X,P,V,logP,v; return val
 
-    # Optional torch.compile
-    if USE_TORCH_COMPILE:
-        print("Compiling model with torch.compile() for performance...")
-        model = torch.compile(model)
+from contextlib import nullcontext
 
-    # Use fused AdamW when available
-    use_fused = DEVICE == "cuda"
-    try:
-        optimizer = optim.AdamW(model.parameters(), lr=lr, fused=use_fused)
-    except TypeError:
-        optimizer = optim.AdamW(model.parameters(), lr=lr)
-
-    if DEVICE == "cuda":
-        if not torch.cuda.is_bf16_supported() and not USE_FP8:
-            raise RuntimeError("bf16 required but not supported on this CUDA device.")
-        print(f"Using device: {DEVICE}")
-        print(f"FP8 training: {'enabled' if USE_FP8 else 'disabled (using bf16)'}")
-    else:
-        print("WARNING: Running on CPU; training will be fp32.")
-
-    print(f"Pretraining from PGN: {pgn_path}")
-    if max_games:
-        print(f"Max games: {max_games}")
-    print(f"Epochs: {epochs}, Batch size: {batch_size}")
-
-    est_games = estimate_game_count(pgn_path)
-    if est_games is not None:
-        print(f"Estimated total games in PGN: {est_games}")
-    else:
-        print("Could not estimate total games; tqdm will show dynamic count only.")
-
-    dataset = PGNDataset(pgn_path, max_games=max_games)
-    if DEVICE == "cuda":
-        num_workers = 8
-        dataloader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            pin_memory=True,
-            prefetch_factor=2,
-            persistent_workers=True,
-        )
-    else:
-        # On MPS/CPU, run single-process data loading for robustness.
-        dataloader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            num_workers=0,  # <--- THIS IS THE KEY
-        )
-
-    for epoch in range(epochs):
-        print(f"\nEpoch {epoch + 1}/{epochs}")
-
-        total_games = None
-        if est_games is not None:
-            effective_games = est_games if max_games is None else min(est_games, max_games)
-            total_games = effective_games
-
-        pbar = tqdm(
-            desc=f"Pretraining games (epoch {epoch + 1}/{epochs})",
-            unit="games",
-            total=total_games,
-        )
-
-        for batch_boards, batch_policy, batch_value in dataloader:
-            loss = train_batch(
-                model,
-                optimizer,
-                batch_boards,
-                batch_policy,
-                batch_value,
-                weight_policy,
-                weight_value,
-            )
-            # Update progress by estimated games processed (assuming ~80 positions per game)
-            pbar.update(round(len(batch_boards) / 80.0, 2))
-            pbar.set_postfix({"loss": f"{loss:.4f}"})
-
+def pretrain(pgn_path=DATA_PATH,model_path_out="chess_model.pt",init_model_path=None,max_games=None,epochs=1,batch_size=512,lr=1e-3,wP=1.0,wV=1.0):
+    assert os.path.exists(pgn_path),f"PGN not found: {pgn_path}"
+    model=load_model(init_model_path,DEVICE)
+    print(f"Params total={sum(p.numel() for p in model.parameters()):,} trainable={sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    if USE_TORCH_COMPILE: model=torch.compile(model)
+    try: opt=optim.AdamW(model.parameters(),lr=lr,fused=DEVICE=="cuda")
+    except: opt=optim.AdamW(model.parameters(),lr=lr)
+    est=estimate_game_count(pgn_path)
+    ds=PGNDataset(pgn_path,max_games)
+    dl=DataLoader(ds,batch_size=batch_size,num_workers=8 if DEVICE=="cuda" else 0,pin_memory=DEVICE=="cuda",prefetch_factor=2,persistent_workers=DEVICE=="cuda")
+    for e in range(epochs):
+        print(f"\nEpoch {e+1}/{epochs}")
+        total_games=None if est is None else min(est,max_games) if max_games else est
+        pbar=tqdm(total=total_games,unit="games",desc=f"Pretraining games (epoch {e+1}/{epochs})")
+        for B,P,V,L in dl:
+            loss=train_batch(model,opt,B,P,V,wP,wV)
+            try: pbar.update(int(L.sum().item()))
+            except: pbar.update(sum(int(x) for x in L))
+            pbar.set_postfix({"loss":f"{loss:.4f}"})
         pbar.close()
-        print(f"Epoch {epoch + 1} completed.")
+        torch.save(model.state_dict(),model_path_out); print(f"Saved model to {model_path_out}")
+    gc.collect(); DEVICE=="cuda" and torch.cuda.empty_cache(); print("Pretraining complete.")
 
-        torch.save(model.state_dict(), model_path_out)
-        print(f"Saved pretrained model to {model_path_out}")
-
-    print("Pretraining complete.")
-
-# ==============================
-# Single batch training
-# ==============================
-def train_batch(
-    model,
-    optimizer,
-    boards,
-    policies,
-    values,
-    weight_policy: float,
-    weight_value: float,
-):
-    model.train()
-
-    X = boards.to(DEVICE, non_blocking=True)
-    target_p = policies.to(DEVICE, non_blocking=True)
-    target_v = values.to(DEVICE, non_blocking=True)
-
-    optimizer.zero_grad(set_to_none=True)
-
-    # FP8 / bf16 autocast logic (mirrors the benchmark script)
-    if USE_FP8 and DEVICE == "cuda" and hasattr(torch, "float8_e4m3fn"):
-        with torch.autocast(device_type="cuda", dtype=torch.float8_e4m3fn):
-            log_p, v = model(X)
-            policy_loss = -(target_p * log_p).sum(dim=1).mean()
-            value_loss = torch.mean((v - target_v) ** 2)
-            loss = weight_policy * policy_loss + weight_value * value_loss
-    else:
-        # This is the corrected, device-aware logic
-        if DEVICE == "cuda":
-            autocast_enabled = torch.cuda.is_bf16_supported()
-            ctx = torch.cuda.amp.autocast(enabled=autocast_enabled, dtype=torch.bfloat16)
-        elif DEVICE == "mps":
-            ctx = torch.amp.autocast(device_type="mps", dtype=torch.bfloat16)
-        else: # CPU
-            class DummyCtx:
-                def __enter__(self_inner): return None
-                def __exit__(self_inner, exc_type, exc, tb): return False
-            ctx = DummyCtx()
-
-        with ctx:
-            log_p, v = model(X)
-            policy_loss = -(target_p * log_p).sum(dim=1).mean()
-            value_loss = torch.mean((v - target_v) ** 2)
-            loss = weight_policy * policy_loss + weight_value * value_loss
-
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    optimizer.step()
-
-    return float(loss.item())
-
-# ==============================
-# CLI parsing
-# ==============================
 def parse_args():
-    parser = argparse.ArgumentParser(description="Supervised pretraining from PGN.")
-    parser.add_argument("--pgn", type=str, default=DATA_PATH, help="Path to PGN file.")
-    parser.add_argument("--init", type=str, default="chess_model.pt", help="Optional initial model checkpoint.")
-    parser.add_argument("--out", type=str, default="chess_model.pt", help="Output model path.")
-    parser.add_argument("--max-games", type=int, default=None, help="Limit number of games.")
-    parser.add_argument("--epochs", type=int, default=1, help="Number of passes over PGN.")
-    parser.add_argument("--batch-size", type=int, default=4096, help="Batch size.")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
-    parser.add_argument("--weight-policy", type=float, default=1.0, help="Policy loss weight.")
-    parser.add_argument("--weight-value", type=float, default=1.0, help="Value loss weight.")
-    return parser.parse_args()
+    p=argparse.ArgumentParser(); p.add_argument("--pgn",default=DATA_PATH); p.add_argument("--init"); p.add_argument("--out",default="chess_model.pt"); p.add_argument("--max-games",type=int); p.add_argument("--epochs",type=int,default=1); p.add_argument("--batch-size",type=int,default=512); p.add_argument("--lr",type=float,default=1e-3); p.add_argument("--weight-policy",type=float,default=1.0); p.add_argument("--weight-value",type=float,default=1.0); return p.parse_args()
 
-def main():
-    args = parse_args()
-    pretrain(
-        pgn_path=args.pgn,
-        model_path_out=args.out,
-        init_model_path=args.init,
-        max_games=args.max_games,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        weight_policy=args.weight_policy,
-        weight_value=args.weight_value,
-    )
+def main(): a=parse_args(); pretrain(a.pgn,a.out,a.init,a.max_games,a.epochs,a.batch_size,a.lr,a.weight_policy,a.weight_value)
 
-if __name__ == "__main__":
-    main()
+if __name__=="__main__": main()

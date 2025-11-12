@@ -1,5 +1,5 @@
 # chess_model.pt
-# *.pt
+*.pt
 __pycache__
 data/data-10m.pgn
 maia/
@@ -16,3 +16,13 @@ moe_model.py
 server-pretrain.py 
 old.pt 
 models_game.pgn
+.gitignore
+download*
+data.py
+mvm.py
+play.py
+tournament.py
+transformer*
+archived
+games
+.vscode

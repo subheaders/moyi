@@ -14,18 +14,22 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from model import load_model
 from utils.pgn_dataset import encode_board
 from collections import defaultdict
+from threading import Lock
 
 # === Config ===
 USE_BFLOAT16 = True
 TEMPERATURE = 0.8
-MODEL_PATH = "chess_model-large.pt"
+MODEL_PATH = "chess_model-2.pt"
 GAMES_PER_OPPONENT = 50
 THREADS = 5
 
-# Paths
-STOCKFISH_PATH = r"stockfish/stockfish.exe"
-MAIA_PATH = r"C:\Users\rukia\Desktop\mini-rl\maia\lc0.exe"
-MAIA_FOLDER = r"C:\Users\rukia\Desktop\mini-rl\maia"
+# New flag: don't use Maia (lc0) on this system
+USE_MAIA = False
+
+# Paths - use system stockfish on Linux
+STOCKFISH_PATH = "/usr/games/stockfish"
+MAIA_PATH = None
+MAIA_FOLDER = None
 
 if torch.cuda.is_available():
     DEVICE = "cuda"
@@ -44,24 +48,26 @@ else:
 
 # === Opponent setups ===
 OPPONENTS = []
-# Stockfish Elo levels
-for elo in [1600, 2000, 2400, 2800]:
+ # Stockfish Elo levels: 800 to 2800 in 200-point intervals
+for elo in range(1320, 2801, 200):
     OPPONENTS.append((f"stockfish-{elo}", STOCKFISH_PATH,
                       {"UCI_LimitStrength": True, "UCI_Elo": elo}, None))
-# Maia Elo levels
-maia_weights = {
-    1100: "maia-1100.pb.gz",
-    1200: "maia-1200.pb.gz",
-    1300: "maia-1300.pb.gz",
-    1400: "maia-1400.pb.gz",
-    1500: "maia-1500.pb.gz",
-    1600: "maia-1600.pb.gz",
-    1800: "maia-1800.pb.gz",
-    1900: "maia-1900.pb.gz",
-}
-for elo, fname in maia_weights.items():
-    OPPONENTS.append((f"maia-{elo}", MAIA_PATH,
-                      {"WeightsFile": os.path.join(MAIA_FOLDER, fname)}, fname))
+
+# Only add Maia opponents when explicitly enabled
+if USE_MAIA:
+    maia_weights = {
+        1100: "maia-1100.pb.gz",
+        1200: "maia-1200.pb.gz",
+        1300: "maia-1300.pb.gz",
+        1400: "maia-1400.pb.gz",
+        1500: "maia-1500.pb.gz",
+        1600: "maia-1600.pb.gz",
+        1800: "maia-1800.pb.gz",
+        1900: "maia-1900.pb.gz",
+    }
+    for elo, fname in maia_weights.items():
+        OPPONENTS.append((f"maia-{elo}", MAIA_PATH,
+                          {"WeightsFile": os.path.join(MAIA_FOLDER, fname)}, fname))
 
 # === Utility helpers ===
 def random_id(length=8):
@@ -120,6 +126,9 @@ def _move_to_index_play(move, board):
     idx = from_sq*73 + (plane-plane_offset)
     return idx if 0 <= idx < 4672 else None
 
+# Global lock for model inference to avoid GPU context contention across threads
+MODEL_LOCK = Lock()
+
 # === Play Game ===
 def play_single_game(model, engine_path, engine_config, opponent_name):
     engine = chess.engine.SimpleEngine.popen_uci(engine_path)
@@ -139,12 +148,14 @@ def play_single_game(model, engine_path, engine_config, opponent_name):
 
     while not board.is_game_over():
         if (board.turn == chess.WHITE and as_white) or (board.turn == chess.BLACK and not as_white):
-            with torch.no_grad(), torch.autocast(device_type=DEVICE, dtype=torch.bfloat16 if USE_BFLOAT16 else torch.float16):
-                inp = encode_board(board).unsqueeze(0).to(DEVICE)
+            # Use a lock around model inference to safely share a single GPU model across threads.
+            with MODEL_LOCK, torch.no_grad(), torch.autocast(device_type=DEVICE, dtype=torch.bfloat16 if USE_BFLOAT16 else torch.float16):
+                inp = encode_board(board).unsqueeze(0).to(DEVICE, non_blocking=True)
                 policy, value = model(inp)
                 move = select_model_move(board, policy)
         else:
-            result_info = engine.play(board, chess.engine.Limit(time=0.1))
+            # Let each thread use its own engine with a short time limit
+            result_info = engine.play(board, chess.engine.Limit(time=0.05))
             move = result_info.move
         board.push(move)
         node = node.add_variation(move)
@@ -163,6 +174,7 @@ def play_single_game(model, engine_path, engine_config, opponent_name):
 
 # === Tournament Runner ===
 def run_tournament():
+    # Load model once and share across threads; pin to eval and inference dtype
     model = load_model(MODEL_PATH, DEVICE).eval()
     ensure_folder("tournament")
     stats = defaultdict(lambda: {"wins": 0, "draws": 0, "losses": 0, "games": 0})
